@@ -11,7 +11,6 @@ import (
 	"net/http/httptest"
 	"net/url"
 	"os"
-	"strings"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -38,9 +37,9 @@ import (
 	"github.com/open-telemetry/opentelemetry-collector-contrib/receiver/prometheusreceiver"
 )
 
-// Test that staleness markers are emitted for timeseries that intermittently disappear.
-// This test runs the entire collector and end-to-end scrapes then checks with the
-// Prometheus remotewrite exporter that staleness markers are emitted per timeseries.
+// TestStalenessMarkersEndToEnd verifies that staleness markers are emitted for every
+// distinct series that disappears and not for series that remain. The scrape server
+// exposes three series; two disappear after 5 scrapes, one remains throughout.
 // See https://github.com/open-telemetry/opentelemetry-collector/issues/3413
 func TestStalenessMarkersEndToEnd(t *testing.T) {
 	if testing.Short() {
@@ -49,7 +48,7 @@ func TestStalenessMarkersEndToEnd(t *testing.T) {
 
 	ctx, cancel := context.WithCancel(t.Context())
 
-	// 1. Setup the server that sends series that intermittently appear and disappear.
+	// 1. Setup the server that sends series 3, two of which disappear after 5 scrapes.
 	n := &atomic.Uint64{}
 	scrapeServer := httptest.NewServer(http.HandlerFunc(func(rw http.ResponseWriter, _ *http.Request) {
 		// Increment the scrape count atomically per scrape.
@@ -61,19 +60,11 @@ func TestStalenessMarkersEndToEnd(t *testing.T) {
 		default:
 		}
 
-		// Alternate metrics per scrape so that every one of
-		// them will be reported as stale.
-		if i%2 == 0 {
-			fmt.Fprintf(rw, `
-# HELP jvm_memory_bytes_used Used bytes of a given JVM memory area.
-# TYPE jvm_memory_bytes_used gauge
-jvm_memory_bytes_used{area="heap"} %.1f`, float64(i))
-		} else {
-			fmt.Fprintf(rw, `
-# HELP jvm_memory_pool_bytes_used Used bytes of a given JVM memory pool.
-# TYPE jvm_memory_pool_bytes_used gauge
-jvm_memory_pool_bytes_used{pool="CodeHeap 'non-nmethods'"} %.1f`, float64(i))
+		if i <= 5 {
+			fmt.Fprintf(rw, "# TYPE test_gauge gauge\ntest_gauge{series=\"0\"} %d\n", i)
+			fmt.Fprintf(rw, "# TYPE test_gauge gauge\ntest_gauge{series=\"1\"} %d\n", i)
 		}
+		fmt.Fprintf(rw, "# TYPE test_gauge gauge\ntest_gauge{series=\"2\"} %d\n", i)
 	}))
 	defer scrapeServer.Close()
 
@@ -102,7 +93,7 @@ jvm_memory_pool_bytes_used{pool="CodeHeap 'non-nmethods'"} %.1f`, float64(i))
 	}))
 	defer prweServer.Close()
 
-	// 3. Set the OpenTelemetry Prometheus receiver.
+	// 3. Configure the OpenTelemetry Collector pipeline.
 	cfg := fmt.Sprintf(`
 receivers:
   prometheus:
@@ -130,6 +121,7 @@ service:
 	defer os.Remove(confFile.Name())
 	_, err = confFile.WriteString(cfg)
 	require.NoError(t, err)
+
 	// 4. Run the OpenTelemetry Collector.
 	receivers, err := otelcol.MakeFactoryMap[receiver.Factory](prometheusreceiver.NewFactory())
 	require.NoError(t, err)
@@ -182,50 +174,38 @@ service:
 		return state == otelcol.StateRunning || state == otelcol.StateClosed || state == otelcol.StateClosing
 	}, 30*time.Second, 10*time.Millisecond, "collector did not start")
 
-	// 5. Let's wait on 10 fetches.
-	var wReqL []*prompb.WriteRequest
+	// 5. Let's wait on 10 fetches so series 0 and 1 have had time to go stale.
+	var allReqs []*prompb.WriteRequest
 	for range 10 {
-		wReqL = append(wReqL, <-prweUploads)
+		allReqs = append(allReqs, <-prweUploads)
 	}
 	defer cancel()
 
-	// 6. Assert that we encounter the stale markers aka special NaNs for the various time series.
-	staleMarkerCount := 0
-	totalSamples := 0
-	require.NotEmpty(t, wReqL, "Expecting at least one WriteRequest")
-	for i, wReq := range wReqL {
-		name := fmt.Sprintf("WriteRequest#%d", i)
-		require.NotEmpty(t, wReq.Timeseries, "Expecting at least 1 timeSeries for:: "+name)
-		for j, ts := range wReq.Timeseries {
-			fullName := fmt.Sprintf("%s/TimeSeries#%d", name, j)
-			assert.NotEmpty(t, ts.Samples, "Expected at least 1 Sample in:: "+fullName)
-
-			// We are strictly counting series directly included in the scrapes, and no
-			// internal timeseries like "up" nor "scrape_seconds" etc.
-			metricName := ""
-			for _, label := range ts.Labels {
-				if label.Name == "__name__" {
-					metricName = label.Value
+	// 6. Assert that we encounter the stale markers per series.
+	stalePerSeries := make(map[string]bool)
+	for _, req := range allReqs {
+		for _, ts := range req.Timeseries {
+			var metricName, seriesLabel string
+			for _, lbl := range ts.Labels {
+				switch lbl.Name {
+				case "__name__":
+					metricName = lbl.Value
+				case "series":
+					seriesLabel = lbl.Value
 				}
 			}
-			if !strings.HasPrefix(metricName, "jvm") {
+			if metricName != "test_gauge" {
 				continue
 			}
-
 			for _, sample := range ts.Samples {
-				totalSamples++
 				if value.IsStaleNaN(sample.Value) {
-					staleMarkerCount++
+					stalePerSeries[seriesLabel] = true
 				}
 			}
 		}
 	}
 
-	require.Positive(t, totalSamples, "Expected at least 1 sample")
-	// On every alternative scrape the prior scrape will be reported as sale.
-	// Expect at least:
-	//    * The first scrape will NOT return stale markers
-	//    * (N-1 / alternatives) = ((10-1) / 2) = ~40% chance of stale markers being emitted.
-	chance := float64(staleMarkerCount) / float64(totalSamples)
-	require.GreaterOrEqualf(t, chance, 0.4, "Expected at least one stale marker: %.3f", chance)
+	assert.True(t, stalePerSeries["0"], "series=0 did not receive a staleness marker")
+	assert.True(t, stalePerSeries["1"], "series=1 did not receive a staleness marker")
+	assert.False(t, stalePerSeries["2"], "series=2 should not have received a staleness marker")
 }
